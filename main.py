@@ -1,4 +1,3 @@
-# prime_viewer_qt_ultrafast.py
 # Version fonctionnelle + design retravaillé (dark, cartes, micro-animations)
 # Compatible PyInstaller (aucune ressource externe, pas d’images, pas d’emojis)
 
@@ -697,8 +696,8 @@ class MainWindow(QMainWindow):
         # Navigation + export
         bottom = QHBoxLayout()
         bottom.setSpacing(10)
-        self.btn_prev = QPushButton("◀ Précédent")
-        self.btn_next = QPushButton("Suivant ▶")
+        self.btn_prev = QPushButton("< Précédent")
+        self.btn_next = QPushButton("Suivant >")
         self.edit_goto = QLineEdit()
         self.edit_goto.setPlaceholderText("Index")
         self.edit_goto.setMaximumWidth(140)
