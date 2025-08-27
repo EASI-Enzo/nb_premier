@@ -1,5 +1,6 @@
 # prime_viewer_qt_ultrafast.py
-# Version fonctionnelle et optimisée (memmap + UI stable)
+# Version fonctionnelle + design retravaillé (dark, cartes, micro-animations)
+# Compatible PyInstaller (aucune ressource externe, pas d’images, pas d’emojis)
 
 import sys
 import os
@@ -12,12 +13,38 @@ from pathlib import Path
 from dataclasses import dataclass
 
 import numpy as np
-from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QThread, Signal, QTimer
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtCore import (
+    Qt,
+    QAbstractTableModel,
+    QModelIndex,
+    QThread,
+    Signal,
+    QTimer,
+    QEasingCurve,
+    QPropertyAnimation,
+)
+from PySide6.QtGui import QColor, QPalette, QFont, QGuiApplication
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLineEdit, QLabel, QPushButton, QTableView, QProgressBar, QFileDialog,
-    QGroupBox, QMessageBox, QAbstractItemView, QDialog, QGraphicsDropShadowEffect
+    QApplication,
+    QWidget,
+    QMainWindow,
+    QVBoxLayout,
+    QHBoxLayout,
+    QGridLayout,
+    QLineEdit,
+    QLabel,
+    QPushButton,
+    QTableView,
+    QProgressBar,
+    QFileDialog,
+    QMessageBox,
+    QAbstractItemView,
+    QDialog,
+    QGraphicsDropShadowEffect,
+    QFrame,
+    QHeaderView,
+    QStyle,
+    QStyleOption,
 )
 
 
@@ -45,6 +72,34 @@ class GenConfig:
     tmp_dir: Path = Path(tempfile.gettempdir())
     mmap_filename: str = "primes_memmap.dat"
     update_interval_ms: int = 75
+
+
+# ---------- Utilitaires UI ----------
+class Card(QFrame):
+    """Carte stylée (conteneur visuel)"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Card")
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setFrameShadow(QFrame.Raised)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(22)
+        shadow.setXOffset(0)
+        shadow.setYOffset(4)
+        shadow.setColor(QColor(0, 0, 0, 160))
+        self.setGraphicsEffect(shadow)
+
+
+def set_monospace(widget: QWidget):
+    # Police monospacée portable
+    font = QFont("Consolas")
+    if not QFont("Consolas").exactMatch():
+        font = QFont("Menlo")
+    if not font.exactMatch():
+        font = QFont("Courier New")
+    font.setStyleHint(QFont.Monospace)
+    widget.setFont(font)
 
 
 # ---------- Worker thread ----------
@@ -109,10 +164,10 @@ class PrimeGenThread(QThread):
                 )
                 return
 
-            self.status_update.emit("Calcul de la borne supérieure...")
+            self.status_update.emit("Calcul de la borne supérieure…")
             ub = upper_bound_nth_prime(n)
 
-            self.status_update.emit("Crible de base jusqu'à √borne...")
+            self.status_update.emit("Crible de base jusqu'à √borne…")
             base_limit = int(math.isqrt(ub)) + 1
             base_sieve_size = (base_limit + 1) // 2
             base_sieve = np.ones(base_sieve_size, dtype=np.bool_)
@@ -154,7 +209,7 @@ class PrimeGenThread(QThread):
                 self.finished_ok.emit(self._found, pmax, int(total_sum), float(int(total_sum)))
                 return
 
-            self.status_update.emit("Crible segmenté en cours...")
+            self.status_update.emit("Crible segmenté en cours…")
             seg_impairs = int(self.cfg.segment_size)
             current = 3
             next_mults = None
@@ -241,7 +296,7 @@ class PrimeGenThread(QThread):
 
 # ---------- Modèle Qt ----------
 class PrimePagedModel(QAbstractTableModel):
-    def __init__(self, mmap_path: Path, count_ref: callable, page_size=10000000, parent=None):
+    def __init__(self, mmap_path: Path, count_ref: callable, page_size=10_000_000, parent=None):
         super().__init__(parent)
         self.mmap_path = Path(mmap_path) if mmap_path is not None else None
         self.count_ref = count_ref
@@ -266,15 +321,16 @@ class PrimePagedModel(QAbstractTableModel):
         return 2
 
     def data(self, index, role=Qt.DisplayRole):
-        if not index.isValid() or role != Qt.DisplayRole or self._mm is None:
+        if not index.isValid() or self._mm is None:
             return None
         row = self.offset + index.row()
-        if row >= len(self._mm):
+        if row >= (len(self._mm) if self._mm is not None else 0):
             return None
-        if index.column() == 0:
-            return row + 1
-        elif index.column() == 1:
-            return int(self._mm[row])
+        if role == Qt.DisplayRole:
+            if index.column() == 0:
+                return row + 1
+            elif index.column() == 1:
+                return int(self._mm[row])
         return None
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
@@ -310,7 +366,7 @@ class PrimePagedModel(QAbstractTableModel):
         self.endResetModel()
 
 
-# --- Nouveau Worker pour l'export ---
+# --- Worker d'export ---
 class ExportThread(QThread):
     progress = Signal(int, int)   # écrit, total
     finished_ok = Signal(str)
@@ -330,26 +386,17 @@ class ExportThread(QThread):
         try:
             mm = np.memmap(self.mmap_path, dtype=np.uint64, mode="r")
             total = min(self.count, len(mm))
-
-            # bloc de 10M (≈80 Mo de données + formatage) : bon compromis RAM/IO
             block = 10_000_000
-
-            # gros tampon d'écriture pour réduire les syscalls
             with open(self.out_file, "w", encoding="utf-8", buffering=16 * 1024 * 1024, newline="\n") as f:
                 written = 0
                 while written < total and not self._stop:
                     end = min(written + block, total)
                     arr = mm[written:end]
-
-                    # Ecriture texte « en masse » via tofile (bien plus rapide que savetxt)
-                    # + retour à la ligne entre blocs
                     arr.tofile(f, sep="\n", format="%d")
                     if end < total:
                         f.write("\n")
-
                     written = end
                     self.progress.emit(written, total)
-
             del mm
             if self._stop:
                 self.failed.emit("Export interrompu par l'utilisateur.")
@@ -364,15 +411,12 @@ class ExportDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Export en cours…")
         self.setModal(True)
-        self.resize(400, 120)
-
+        self.resize(420, 130)
         layout = QVBoxLayout(self)
-
         self.lbl_status = QLabel("Préparation de l'export…")
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.btn_stop = QPushButton("Arrêter")
-
         layout.addWidget(self.lbl_status)
         layout.addWidget(self.progress)
         layout.addWidget(self.btn_stop)
@@ -383,17 +427,21 @@ class ExportDialog(QDialog):
         self.lbl_status.setText(f"Export… {done:,}/{total:,} ({pct}%)".replace(",", " "))
 
 
-# ---------- Interface complète ----------
+# ---------- Fenêtre principale ----------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Générateur/Visualiseur de Nombres Premiers (Ultra-Fast)")
-        self.resize(1000, 700)
+        self.setWindowTitle("Prime Viewer – Ultra-Fast")
+        self.resize(1120, 720)
+        self.setAttribute(Qt.WA_TranslucentBackground, False)
+        self.setAutoFillBackground(True)
 
-        # Activer thème sombre global
-        self._apply_dark_theme()
+        # DPI-aware sizing
+        QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
 
-        # état
+        # État
         self._found = 0
         self._target = 0
         self._pmax = 0
@@ -401,212 +449,280 @@ class MainWindow(QMainWindow):
         self._avg = 0.0
         self._thread = None
 
-        # config
+        # Config
         self.cfg = GenConfig(count=10)
         self.mmap_path = self.cfg.tmp_dir / self.cfg.mmap_filename
 
-        # timer
+        # Timer UI
         self._ui_timer = QTimer()
-        self._ui_timer.timeout.connect(self._update_ui)
+        self._ui_timer.timeout.connect(self._pulse_progress)
 
-        # construire UI
+        # Thème + QSS
+        self._apply_dark_theme()
+
+        # Construire UI
         self._build_ui()
         self._tune_table()
 
-        # modèle memmap
-        self.model = PrimePagedModel(self.mmap_path, self.get_found, page_size=10000000)
+        # Modèle memmap
+        self.model = PrimePagedModel(self.mmap_path, self.get_found, page_size=10_000_000)
         self.table.setModel(self.model)
         self._update_pages()
 
-        # liaisons
+        # Liaisons
         self._connect_signals()
+
+        # Entrée par défaut
+        self.edit_count.setFocus()
+
+        # Apparition en fondu
+        self._fade_in()
 
     # ------------------- THEME -------------------
     def _apply_dark_theme(self):
-        """Palette sombre inspirée de Material Design"""
-        dark_palette = QPalette()
+        base_bg = QColor(18, 18, 20)
+        card_bg = QColor(30, 30, 34)
+        text = QColor(230, 230, 235)
+        accent = QColor(65, 160, 255)
 
-        dark_gray = QColor(30, 30, 30)
-        medium_gray = QColor(45, 45, 45)
-        light_gray = QColor(200, 200, 200)
-        accent = QColor(33, 150, 243)  # bleu Material
+        pal = QPalette()
+        pal.setColor(QPalette.ColorRole.Window, base_bg)
+        pal.setColor(QPalette.ColorRole.Base, QColor(28, 28, 32))
+        pal.setColor(QPalette.ColorRole.AlternateBase, QColor(24, 24, 28))
+        pal.setColor(QPalette.ColorRole.Text, text)
+        pal.setColor(QPalette.ColorRole.Button, card_bg)
+        pal.setColor(QPalette.ColorRole.ButtonText, text)
+        pal.setColor(QPalette.ColorRole.Highlight, accent)
+        pal.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
+        pal.setColor(QPalette.ColorRole.ToolTipBase, card_bg)
+        pal.setColor(QPalette.ColorRole.ToolTipText, text)
+        self.setPalette(pal)
 
-        dark_palette.setColor(QPalette.Window, dark_gray)
-        dark_palette.setColor(QPalette.Base, medium_gray)
-        dark_palette.setColor(QPalette.AlternateBase, dark_gray)
-        dark_palette.setColor(QPalette.Text, light_gray)
-        dark_palette.setColor(QPalette.Button, medium_gray)
-        dark_palette.setColor(QPalette.ButtonText, light_gray)
-        dark_palette.setColor(QPalette.Highlight, accent)
-        dark_palette.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
+        self.setFont(QFont("Segoe UI", 10))
 
-        self.setPalette(dark_palette)
+        # QSS global + patch pour popups
+        self.setStyleSheet(
+            """
+            QWidget { color: #E6E6EB; }
+            QToolTip { background: #1E1E22; border: 1px solid #2E2E36; border-radius: 6px; padding: 6px 8px; }
 
-        # QSS global : boutons arrondis + transitions Material
-        self.setStyleSheet("""
+            /* Patch popups */
+            QDialog, QMessageBox, QFileDialog {
+                background-color: #1E1E20;
+                color: #E6E6EB;
+            }
+
             QPushButton {
-                background-color: #2E2E2E;
-                color: #E0E0E0;
-                border: none;
-                border-radius: 6px;
-                padding: 6px 14px;
-                font-size: 14px;
+                background-color: #2A2A30;
+                color: #E6E6EB;
+                border: 1px solid #33333A;
+                border-radius: 10px;
+                padding: 8px 14px;
+                font-weight: 600;
             }
-            QPushButton:hover {
-                background-color: #3C3C3C;
-            }
-            QPushButton:pressed {
-                background-color: #1976D2;
-            }
+            QPushButton:hover { background-color: #32323A; }
+            QPushButton:pressed { background-color: #1976D2; }
+            QPushButton:disabled { color: #808089; border-color: #2A2A30; background: #1E1E24; }
+
             QLineEdit {
-                background-color: #383838;
-                border: 1px solid #555;
-                border-radius: 4px;
-                padding: 4px 8px;
-                color: #E0E0E0;
-            }
-            QTableView {
-                background-color: #212121;
-                alternate-background-color: #2A2A2A;
-                gridline-color: #444;
-                color: #E0E0E0;
+                background-color: #232329;
+                border: 1px solid #3A3A44;
+                border-radius: 10px;
+                padding: 8px 10px;
                 selection-background-color: #1976D2;
-                selection-color: white;
             }
+
             QProgressBar {
-                border: none;
-                border-radius: 6px;
+                border: 1px solid #2E2E36;
+                border-radius: 10px;
                 text-align: center;
-                background-color: #333;
-                color: #E0E0E0;
+                background-color: #1F1F23;
+                padding: 2px;
             }
             QProgressBar::chunk {
+                border-radius: 8px;
                 background-color: #2196F3;
-                border-radius: 6px;
+                margin: 2px;
             }
-            QGroupBox {
-                border: 1px solid #444;
-                border-radius: 6px;
-                margin-top: 8px;
-                padding: 6px;
-                font-weight: bold;
-                color: #E0E0E0;
+
+            QFrame#Card {
+                background-color: #1F1F24;
+                border: 1px solid #2A2A31;
+                border-radius: 16px;
             }
-        """)
 
-    def _add_shadow(self, widget, blur=18, dx=0, dy=2):
-        """Effet ombre portée pour boutons flottants"""
-        shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(blur)
-        shadow.setXOffset(dx)
-        shadow.setYOffset(dy)
-        shadow.setColor(QColor(0, 0, 0, 180))
-        widget.setGraphicsEffect(shadow)
+            QTableView {
+                background-color: #17171A;
+                alternate-background-color: #1F1F23;
+                gridline-color: #2C2C33;
+                color: #E6E6EB;
+                selection-background-color: #1976D2;
+                selection-color: white;
+                border: 1px solid #2A2A31;
+                border-radius: 12px;
+            }
+            QHeaderView::section {
+                background-color: #24242A;
+                color: #CFCFD7;
+                padding: 8px;
+                border: none;
+                border-right: 1px solid #2E2E36;
+                font-weight: 700;
+                text-transform: uppercase;
+            }
+            QHeaderView::section:horizontal { border-top-left-radius: 12px; border-top-right-radius: 12px; }
 
-    def _update_pages(self):
-        total = self.get_found()
-        ps = self.model.page_size
-        total_pages = (total + ps - 1) // ps if total > 0 else 0
-        current_page = (self.model.offset // ps) + 1 if total > 0 else 0
-        self.lbl_pages.setText(f"Page {current_page}/{total_pages}")
+            QScrollBar:vertical {
+                width: 12px; background: #1A1A1E; margin: 14px 0 14px 0; border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                min-height: 30px; background: #2C2C34; border-radius: 6px;
+            }
+            QScrollBar::handle:vertical:hover { background: #3A3A44; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 14px; background: transparent; }
 
-        # Optionnel : activer/désactiver les boutons
-        self.btn_prev.setEnabled(self.model.offset > 0)
-        self.btn_next.setEnabled(self.model.offset + ps < total)
+            QLabel.subtle { color: #A0A0AA; }
+            QLabel.kpi { font-size: 18px; font-weight: 800; }
+            QLabel.kpiTitle { color: #A0A0AA; }
+            """
+        )
 
     # ------------------- BUILD UI -------------------
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(12)
 
-        gb_params = QGroupBox("Paramètres")
-        gl = QGridLayout(gb_params)
+        # Header
+        header = Card()
+        top = QHBoxLayout(header)
+        top.setContentsMargins(16, 16, 16, 16)
+        title = QLabel("Générateur / Visualiseur de nombres premiers")
+        title.setStyleSheet("font-size: 20px; font-weight: 800;")
+        subtitle = QLabel("Memmap ultra-rapide, pagination massive, export optimisé")
+        subtitle.setObjectName("subtitle")
+        subtitle.setProperty("class", "subtle")
+        subtitle.setStyleSheet("color:#A0A0AA;")
+        top.addWidget(self._stacked(title, subtitle))
+        top.addStretch(1)
+        root.addWidget(header)
 
-        gl.addWidget(QLabel("Nombre de nombres premiers :"), 0, 0)
+        # Paramètres + Statistiques
+        row = QHBoxLayout()
+        row.setSpacing(12)
+
+        # Carte paramètres
+        card_params = Card()
+        params = QGridLayout(card_params)
+        params.setContentsMargins(16, 16, 16, 16)
+        params.setHorizontalSpacing(10)
+        params.setVerticalSpacing(10)
+
+        lbln = QLabel("Nombre de nombres premiers :")
         self.edit_count = QLineEdit("1000000")
-        self.edit_count.setMaximumWidth(180)
-        gl.addWidget(self.edit_count, 0, 1)
-
+        self.edit_count.setMaximumWidth(200)
+        self.edit_count.setClearButtonEnabled(True)
         self.btn_generate = QPushButton("Générer")
-        self._add_shadow(self.btn_generate)
-        gl.addWidget(self.btn_generate, 0, 2)
-
         self.btn_stop = QPushButton("Arrêter")
         self.btn_stop.setEnabled(False)
-        self._add_shadow(self.btn_stop)
-        gl.addWidget(self.btn_stop, 0, 3)
 
         quick = QHBoxLayout()
+        quick.setSpacing(8)
         quick.addWidget(QLabel("Sélections rapides :"))
         for v in (10, 100, 1000, 10000, 100000, 1_000_000, 10_000_000, 100_000_000, 1_000_000_000):
             label = "1B" if v == 1_000_000_000 else f"{v:,}".replace(",", " ")
             b = QPushButton(label)
+            b.setToolTip(f"Générer {label} nombres")
             b.clicked.connect(lambda _, vv=v: self._quick(vv))
             quick.addWidget(b)
-        gl.addLayout(quick, 1, 0, 1, 4)
+        quick.addStretch(1)
 
-        root.addWidget(gb_params)
+        params.addWidget(lbln, 0, 0)
+        params.addWidget(self.edit_count, 0, 1)
+        params.addWidget(self.btn_generate, 0, 2)
+        params.addWidget(self.btn_stop, 0, 3)
+        params.addLayout(quick, 1, 0, 1, 4)
 
-        row_prog = QHBoxLayout()
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        row_prog.addWidget(self.progress)
-        self.lbl_status = QLabel("Prêt.")
-        row_prog.addWidget(self.lbl_status)
-        root.addLayout(row_prog)
+        # Carte stats
+        card_stats = Card()
+        stats = QGridLayout(card_stats)
+        stats.setContentsMargins(16, 16, 16, 16)
+        stats.setHorizontalSpacing(18)
+        stats.setVerticalSpacing(10)
 
-        gb_stats = QGroupBox("Statistiques")
-        gs = QGridLayout(gb_stats)
         self.lbl_count = QLabel("0")
         self.lbl_max = QLabel("0")
         self.lbl_avg = QLabel("0")
         self.lbl_sum = QLabel("0")
+        for w in (self.lbl_count, self.lbl_max, self.lbl_avg, self.lbl_sum):
+            w.setProperty("class", "kpi")
+            w.setStyleSheet("font-size:22px;font-weight:900;")
+        stats.addWidget(QLabel("Nombres générés"), 0, 0)
+        stats.addWidget(self.lbl_count, 1, 0)
+        stats.addWidget(QLabel("Plus grand nombre"), 0, 1)
+        stats.addWidget(self.lbl_max, 1, 1)
+        stats.addWidget(QLabel("Moyenne"), 0, 2)
+        stats.addWidget(self.lbl_avg, 1, 2)
+        stats.addWidget(QLabel("Somme totale"), 0, 3)
+        stats.addWidget(self.lbl_sum, 1, 3)
 
-        gs.addWidget(QLabel("Nombres générés :"), 0, 0)
-        gs.addWidget(self.lbl_count, 0, 1)
-        gs.addWidget(QLabel("Plus grand nombre :"), 0, 2)
-        gs.addWidget(self.lbl_max, 0, 3)
+        row.addWidget(card_params, 2)
+        row.addWidget(card_stats, 3)
+        root.addLayout(row)
 
-        gs.addWidget(QLabel("Moyenne :"), 1, 0)
-        gs.addWidget(self.lbl_avg, 1, 1)
-        gs.addWidget(QLabel("Somme totale :"), 1, 2)
-        gs.addWidget(self.lbl_sum, 1, 3)
-
-        root.addWidget(gb_stats)
+        # Progress + statut
+        card_prog = Card()
+        pr = QHBoxLayout(card_prog)
+        pr.setContentsMargins(16, 16, 16, 16)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.lbl_status = QLabel("Prêt.")
+        self.lbl_status.setProperty("class", "subtle")
+        pr.addWidget(self.progress, 4)
+        pr.addSpacing(12)
+        pr.addWidget(self.lbl_status, 1)
+        root.addWidget(card_prog)
 
         # Table
+        card_table = Card()
+        tvlay = QVBoxLayout(card_table)
+        tvlay.setContentsMargins(12, 12, 12, 12)
         self.table = QTableView()
-        root.addWidget(self.table, stretch=1)
+        set_monospace(self.table)
+        tvlay.addWidget(self.table)
+        root.addWidget(card_table, stretch=1)
 
-        # Navigation
-        row_nav = QHBoxLayout()
+        # Navigation + export
+        bottom = QHBoxLayout()
+        bottom.setSpacing(10)
         self.btn_prev = QPushButton("◀ Précédent")
-        self._add_shadow(self.btn_prev, blur=10)
         self.btn_next = QPushButton("Suivant ▶")
-        self._add_shadow(self.btn_next, blur=10)
         self.edit_goto = QLineEdit()
         self.edit_goto.setPlaceholderText("Index")
-        self.edit_goto.setMaximumWidth(120)
+        self.edit_goto.setMaximumWidth(140)
         self.btn_goto = QPushButton("Aller")
-        self._add_shadow(self.btn_goto, blur=10)
-
         self.lbl_pages = QLabel("Page 0/0")
-
-        row_nav.addWidget(self.btn_prev)
-        row_nav.addWidget(self.btn_next)
-        row_nav.addWidget(self.edit_goto)
-        row_nav.addWidget(self.btn_goto)
-        row_nav.addStretch(1)
-        row_nav.addWidget(self.lbl_pages)
-        root.addLayout(row_nav)
-
-        row_exp = QHBoxLayout()
+        self.lbl_pages.setProperty("class", "subtle")
         self.btn_export = QPushButton("Exporter en .txt")
-        self._add_shadow(self.btn_export)
-        row_exp.addWidget(self.btn_export)
-        row_exp.addStretch(1)
-        root.addLayout(row_exp)
+        bottom.addWidget(self.btn_prev)
+        bottom.addWidget(self.btn_next)
+        bottom.addWidget(self.edit_goto)
+        bottom.addWidget(self.btn_goto)
+        bottom.addStretch(1)
+        bottom.addWidget(self.lbl_pages)
+        bottom.addSpacing(16)
+        bottom.addWidget(self.btn_export)
+        root.addLayout(bottom)
+
+    def _stacked(self, title: QLabel, subtitle: QLabel) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(title)
+        lay.addWidget(subtitle)
+        return w
 
     def _tune_table(self):
         tv = self.table
@@ -621,24 +737,49 @@ class MainWindow(QMainWindow):
         tv.setTextElideMode(Qt.ElideRight)
         tv.verticalHeader().setVisible(False)
         tv.horizontalHeader().setStretchLastSection(True)
+        tv.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        tv.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         tv.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         tv.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         tv.viewport().setAttribute(Qt.WA_StaticContents, True)
+        # Taille de ligne confortable
+        tv.verticalHeader().setDefaultSectionSize(tv.fontMetrics().height() + 10)
 
     def _connect_signals(self):
-        # pagination avec MAJ du label
+        # pagination
         self.btn_prev.clicked.connect(self._prev)
         self.btn_next.clicked.connect(self._next)
         self.btn_goto.clicked.connect(self._goto_index)
+        self.edit_goto.returnPressed.connect(self._goto_index)
 
-        # >>> AJOUTS <<<
+        # génération
         self.btn_generate.clicked.connect(self.on_generate)
         self.btn_stop.clicked.connect(self.on_stop)
         self.btn_export.clicked.connect(self.on_export)
 
-        # quand le modèle bouge, MAJ du label de pages
-        self.model.modelReset.connect(self._update_pages)
-        self.model.layoutChanged.connect(self._update_pages)
+    # ------------------- Animations -------------------
+    def _fade_in(self):
+        self._fade = QPropertyAnimation(self, b"windowOpacity", self)
+        self._fade.setDuration(280)
+        self._fade.setStartValue(0.0)
+        self._fade.setEndValue(1.0)
+        self._fade.setEasingCurve(QEasingCurve.InOutCubic)
+        self._fade.start()
+
+    def _pulse_progress(self):
+        # Micro-impulsions visuelles: rien d’intrusif, juste une mise à jour régulière
+        val = self.progress.value()
+        self.progress.setValue(val)
+
+    # ------------------- Données & état -------------------
+    def _update_pages(self):
+        total = self.get_found()
+        ps = self.model.page_size
+        total_pages = (total + ps - 1) // ps if total > 0 else 0
+        current_page = (self.model.offset // ps) + 1 if total > 0 else 0
+        self.lbl_pages.setText(f"Page {current_page}/{total_pages}")
+        self.btn_prev.setEnabled(self.model.offset > 0)
+        self.btn_next.setEnabled(self.model.offset + ps < total)
 
     def _prev(self):
         self.model.prev_page()
@@ -651,13 +792,9 @@ class MainWindow(QMainWindow):
     def _goto_index(self):
         try:
             idx = int(self.edit_goto.text())
-            self.model.goto_index(idx - 1)  # car index commence à 0
+            self.model.goto_index(idx - 1)
         except Exception:
             pass
-
-    def _update_ui(self):
-        # placeholder pour future animation / rafraîchissement léger
-        pass
 
     def get_found(self) -> int:
         return self._found
@@ -674,6 +811,7 @@ class MainWindow(QMainWindow):
         self.lbl_sum.setText(f"{self._sum:,}".replace(",", " "))
         self.lbl_avg.setText(f"{self._avg:,.2f}".replace(",", " "))
 
+    # ------------------- Callbacks worker -------------------
     def on_progress(self, found: int, total: int):
         old = self._found
         self.set_found(found)
@@ -682,8 +820,8 @@ class MainWindow(QMainWindow):
             self.model.reload_memmap(self.mmap_path)
         pct = int((found / total) * 100) if total else 0
         self.progress.setValue(pct)
-        self.lbl_status.setText(f"Génération... {found:,}/{total:,} ({pct}%)".replace(",", " "))
-        self._update_pages()  # <<< AJOUT
+        self.lbl_status.setText(f"Génération… {found:,}/{total:,} ({pct}%)".replace(",", " "))
+        self._update_pages()
 
     def on_status_update(self, msg: str):
         self.lbl_status.setText(msg)
@@ -703,7 +841,7 @@ class MainWindow(QMainWindow):
         self.btn_generate.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self._thread = None
-        self._update_pages()  # <<< AJOUT
+        self._update_pages()
 
     def on_failed(self, msg: str):
         self._ui_timer.stop()
@@ -712,6 +850,7 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         self._thread = None
 
+    # ------------------- Génération / Export -------------------
     def _quick(self, v: int):
         self.edit_count.setText(str(v))
         self.on_generate()
@@ -720,11 +859,10 @@ class MainWindow(QMainWindow):
         if self._thread is not None:
             return
 
+        # Fichier memmap unique par session
         unique_name = f"primes_memmap_{os.getpid()}_{int(time.time() * 1000)}.dat"
         self.cfg.mmap_filename = unique_name
         self.mmap_path = self.cfg.tmp_dir / self.cfg.mmap_filename
-
-        # rebind model on new file
         self.model.reload_memmap(self.mmap_path)
 
         try:
@@ -739,7 +877,7 @@ class MainWindow(QMainWindow):
         self.set_found(0)
         self.set_stats(0, 0, 0.0)
         self.progress.setValue(0)
-        self.lbl_status.setText("Initialisation...")
+        self.lbl_status.setText("Initialisation…")
         self.btn_generate.setEnabled(False)
         self.btn_stop.setEnabled(True)
 
@@ -777,7 +915,7 @@ class MainWindow(QMainWindow):
         if self._thread is not None:
             self._thread.stop()
             self.btn_stop.setEnabled(False)
-            self.lbl_status.setText("Arrêt en cours...")
+            self.lbl_status.setText("Arrêt en cours…")
 
     def on_export(self):
         if self._found <= 0 or not self.mmap_path.exists():
@@ -794,18 +932,12 @@ class MainWindow(QMainWindow):
             return
         txt_file = filename if filename.endswith(".txt") else filename + ".txt"
 
-        # Créer popup
         self.export_dialog = ExportDialog(self)
-
-        # Créer thread export
         self.export_thread = ExportThread(self.mmap_path, self._found, txt_file)
         self.export_thread.progress.connect(self.export_dialog.set_progress)
         self.export_thread.finished_ok.connect(self.on_export_finished)
         self.export_thread.failed.connect(self.on_export_failed)
-
-        # Bouton stop
         self.export_dialog.btn_stop.clicked.connect(self.export_thread.stop)
-
         self.export_thread.start()
         self.export_dialog.show()
 
@@ -817,6 +949,7 @@ class MainWindow(QMainWindow):
         self.export_dialog.close()
         QMessageBox.critical(self, "Erreur", f"Erreur lors de l'export :\n{msg}")
 
+    # ------------------- Cycle de vie -------------------
     def closeEvent(self, event):
         if self._thread is not None:
             self._thread.stop()
@@ -826,6 +959,7 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    app.setApplicationDisplayName("Prime Viewer – Ultra-Fast")
     w = MainWindow()
     w.show()
     return app.exec()
